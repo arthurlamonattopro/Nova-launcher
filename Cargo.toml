@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 iced = "0.14.0"
 mc-launcher-core = "0.1.1"
-reqwest = { version = "0.13.4", features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.13.4", features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+zip = "0.6"
+walkdir = "2.3"

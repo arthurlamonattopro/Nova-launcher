@@ -14,6 +14,11 @@ use crate::core::{
     LaunchProgress, LaunchRequest, LoaderChoice, MinecraftVersion, VersionKind,
     default_minecraft_dir, launch_with_progress, list_versions,
 };
+use crate::mods::{
+    install_project, list_installed_projects, search_projects, uninstall_project,
+    InstallProjectReport, InstallProjectRequest, ManagedProject, ProjectKind,
+    ProjectSearchRequest, ProjectSource,
+};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -26,12 +31,33 @@ pub enum Message {
     ShowOldAlphaChanged(bool),
     RefreshVersions,
     VersionsLoaded(Result<Vec<MinecraftVersion>, String>),
+    InitialDataLoaded(Result<(Vec<MinecraftVersion>, Vec<ManagedProject>), String>),
     LoaderChanged(LoaderChoice),
     JavaPathChanged(String),
     MinecraftDirChanged(String),
     MemoryChanged(u16),
     LaunchPressed,
+    LaunchModpackPressed(ManagedProject),
     LaunchEvent(LaunchProgress),
+    TabSelected(Tab),
+    ProjectSourceChanged(ProjectSource),
+    ProjectKindChanged(ProjectKind),
+    ProjectQueryChanged(String),
+    CurseForgeApiKeyChanged(String),
+    SearchProjects,
+    ProjectsLoaded(Result<Vec<ManagedProject>, String>),
+    InstallProjectPressed(ManagedProject),
+    InstallProjectResult(Result<InstallProjectReport, String>),
+    RefreshInstalledProjects,
+    InstalledProjectsLoaded(Vec<ManagedProject>),
+    UninstallProjectPressed(ManagedProject),
+    UninstallProjectResult(Result<(), String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Launcher,
+    Mods,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +77,17 @@ pub struct NovaLauncher {
     status: String,
     progress_percent: f32,
     busy: bool,
+    tab: Tab,
+    project_source: ProjectSource,
+    project_kind: ProjectKind,
+    project_query: String,
+    curseforge_api_key: String,
+    search_results: Vec<ManagedProject>,
+    search_loading: bool,
+    search_error: String,
+    installed_projects: Vec<ManagedProject>,
+    installed_loading: bool,
+    project_action_busy: bool,
 }
 
 impl Default for NovaLauncher {
@@ -71,6 +108,17 @@ impl Default for NovaLauncher {
             status: "Loading Minecraft versions...".to_string(),
             progress_percent: 0.0,
             busy: false,
+            tab: Tab::Launcher,
+            project_source: ProjectSource::Modrinth,
+            project_kind: ProjectKind::Mod,
+            project_query: String::new(),
+            curseforge_api_key: String::new(),
+            search_results: Vec::new(),
+            search_loading: false,
+            search_error: String::new(),
+            installed_projects: Vec::new(),
+            installed_loading: true,
+            project_action_busy: false,
         }
     }
 }
@@ -91,7 +139,10 @@ pub fn run() -> iced::Result {
 fn boot() -> (NovaLauncher, Task<Message>) {
     (
         NovaLauncher::default(),
-        Task::perform(async { list_versions() }, Message::VersionsLoaded),
+        Task::perform(async {
+            let installed = list_installed_projects(&default_minecraft_dir());
+            list_versions().map(|versions| (versions, installed))
+        }, Message::InitialDataLoaded),
     )
 }
 
@@ -137,6 +188,156 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::InitialDataLoaded(result) => {
+            app.versions_loading = false;
+            app.installed_loading = false;
+
+            match result {
+                Ok((versions, installed)) => {
+                    if app.minecraft_version.trim().is_empty() {
+                        if let Some(version) = versions
+                            .iter()
+                            .find(|version| version.kind == VersionKind::Release)
+                        {
+                            app.minecraft_version = version.id.clone();
+                        }
+                    }
+
+                    app.versions = versions;
+                    app.installed_projects = installed;
+                    app.status = format!("Loaded Minecraft versions and installed projects.");
+                }
+                Err(error) => {
+                    app.status = error;
+                }
+            }
+        }
+        Message::ProjectsLoaded(result) => {
+            app.search_loading = false;
+            app.search_error.clear();
+
+            match result {
+                Ok(projects) => {
+                    app.search_results = projects;
+                    app.status = format!("Loaded {} search results.", app.search_results.len());
+                }
+                Err(error) => {
+                    app.search_error = error;
+                    app.status = "Search failed.".to_string();
+                }
+            }
+        }
+        Message::InstallProjectPressed(project) => {
+            if app.project_action_busy {
+                return Task::none();
+            }
+
+            app.project_action_busy = true;
+            app.status = format!("Installing {}...", project.title);
+
+            let request = InstallProjectRequest {
+                project,
+                minecraft_dir: PathBuf::from(app.minecraft_dir.trim()),
+                minecraft_version: app.minecraft_version.clone(),
+                loader: app.loader,
+                curseforge_api_key: app.curseforge_api_key.clone(),
+            };
+
+            return Task::perform(async move { install_project(request) }, Message::InstallProjectResult);
+        }
+        Message::InstallProjectResult(result) => {
+            app.project_action_busy = false;
+
+            match result {
+                Ok(report) => {
+                    app.status = format!(
+                        "Installed {} to {}.",
+                        report.filename,
+                        report.destination.display()
+                    );
+
+                    let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
+                    app.installed_loading = true;
+                    return Task::perform(async move {
+                        list_installed_projects(&minecraft_dir)
+                    }, Message::InstalledProjectsLoaded);
+                }
+                Err(error) => {
+                    app.status = error;
+                }
+            }
+        }
+        Message::RefreshInstalledProjects => {
+            if app.installed_loading {
+                return Task::none();
+            }
+
+            app.installed_loading = true;
+            app.status = "Refreshing installed projects...".to_string();
+            let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
+
+            return Task::perform(async move { list_installed_projects(&minecraft_dir) }, Message::InstalledProjectsLoaded);
+        }
+        Message::InstalledProjectsLoaded(installed) => {
+            app.installed_loading = false;
+            app.installed_projects = installed;
+            app.status = format!("Loaded {} installed items.", app.installed_projects.len());
+        }
+        Message::UninstallProjectPressed(project) => {
+            if app.project_action_busy {
+                return Task::none();
+            }
+
+            app.project_action_busy = true;
+            app.status = format!("Removing {}...", project.title);
+            let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
+
+            return Task::perform(async move { uninstall_project(&project, &minecraft_dir) }, Message::UninstallProjectResult);
+        }
+        Message::UninstallProjectResult(result) => {
+            app.project_action_busy = false;
+
+            match result {
+                Ok(()) => {
+                    app.status = "Project removed successfully.".to_string();
+                    let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
+                    app.installed_loading = true;
+                    return Task::perform(async move {
+                        list_installed_projects(&minecraft_dir)
+                    }, Message::InstalledProjectsLoaded);
+                }
+                Err(error) => {
+                    app.status = error;
+                }
+            }
+        }
+        Message::TabSelected(tab) => {
+            app.tab = tab;
+        }
+        Message::ProjectSourceChanged(value) => app.project_source = value,
+        Message::ProjectKindChanged(value) => app.project_kind = value,
+        Message::ProjectQueryChanged(value) => app.project_query = value,
+        Message::CurseForgeApiKeyChanged(value) => app.curseforge_api_key = value,
+        Message::SearchProjects => {
+            if app.search_loading {
+                return Task::none();
+            }
+
+            app.search_loading = true;
+            app.search_error.clear();
+            app.status = "Searching mods and modpacks...".to_string();
+
+            let request = ProjectSearchRequest {
+                source: app.project_source,
+                kind: app.project_kind,
+                query: app.project_query.clone(),
+                minecraft_version: app.minecraft_version.clone(),
+                loader: app.loader,
+                curseforge_api_key: app.curseforge_api_key.clone(),
+            };
+
+            return search_task(request);
+        }
         Message::LoaderChanged(value) => app.loader = value,
         Message::JavaPathChanged(value) => app.java_path = value,
         Message::MinecraftDirChanged(value) => app.minecraft_dir = value,
@@ -152,6 +353,35 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
 
             let request = LaunchRequest {
                 minecraft_dir: PathBuf::from(app.minecraft_dir.trim()),
+                username: app.username.clone(),
+                minecraft_version: app.minecraft_version.clone(),
+                loader: app.loader,
+                java_path: optional_path(&app.java_path),
+                memory_mb: app.memory_mb,
+            };
+
+            return launch_task(request);
+        }
+        Message::LaunchModpackPressed(project) => {
+            if app.busy {
+                return Task::none();
+            }
+
+            let modpack_dir = PathBuf::from(app.minecraft_dir.trim())
+                .join("modpacks")
+                .join(&project.id);
+
+            if !modpack_dir.exists() {
+                app.status = format!("Modpack profile directory not found: {}", modpack_dir.display());
+                return Task::none();
+            }
+
+            app.busy = true;
+            app.progress_percent = 0.0;
+            app.status = format!("Launching modpack profile {}...", project.title);
+
+            let request = LaunchRequest {
+                minecraft_dir: modpack_dir,
                 username: app.username.clone(),
                 minecraft_version: app.minecraft_version.clone(),
                 loader: app.loader,
@@ -200,6 +430,45 @@ fn view_responsive(app: &NovaLauncher, size: Size) -> Element<'_, Message> {
         .wrapping(Wrapping::Word)
         .color([0.72, 0.76, 0.82]);
 
+    let tabs = row![
+        tab_button("Launcher", Tab::Launcher, app.tab),
+        tab_button("Mods & Modpacks", Tab::Mods, app.tab),
+    ]
+    .spacing(12);
+
+    let body = match app.tab {
+        Tab::Launcher => launcher_body(app, layout),
+        Tab::Mods => mods_body(app, layout),
+    };
+
+    let content = column![
+        title,
+        subtitle,
+        tabs,
+        rule::horizontal(1),
+        body,
+        text(&app.status)
+            .size(14)
+            .wrapping(Wrapping::Word)
+            .color(if app.busy || app.project_action_busy {
+                [0.84, 0.78, 0.48]
+            } else {
+                [0.62, 0.82, 0.70]
+            }),
+    ]
+    .spacing(layout.spacing())
+    .padding(layout.padding())
+    .width(Length::Fill)
+    .max_width(layout.max_content_width());
+
+    container(scrollable(content))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .into()
+}
+
+fn launcher_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
     let username = field(
         "Username",
         text_input("Steve", &app.username)
@@ -266,35 +535,231 @@ fn view_responsive(app: &NovaLauncher, size: Size) -> Element<'_, Message> {
     let identity = responsive_pair(username, version, layout);
     let runtime = responsive_pair(loader, memory.into(), layout);
 
-    let content = column![
-        title,
-        subtitle,
-        rule::horizontal(1),
+    column![
         identity,
         runtime,
         java_path,
         minecraft_dir,
         progress,
         launch_button,
-        text(&app.status)
-            .size(14)
-            .wrapping(Wrapping::Word)
-            .color(if app.busy {
-                [0.84, 0.78, 0.48]
-            } else {
-                [0.62, 0.82, 0.70]
-            }),
     ]
     .spacing(layout.spacing())
-    .padding(layout.padding())
     .width(Length::Fill)
-    .max_width(layout.max_content_width());
+    .into()
+}
 
-    container(scrollable(content))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .into()
+fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
+    let mods_logo = row![
+        container(text("🧩").size(32)).padding(10),
+        column![
+            text("Mods & Modpacks").size(24),
+            text("Browse, install, and manage your modded Minecraft setup.")
+                .size(14)
+                .color([0.78, 0.78, 0.78])
+                .wrapping(Wrapping::Word),
+        ]
+    ]
+    .spacing(12)
+    .align_y(alignment::Vertical::Center);
+
+    let version = field(
+        "Minecraft version",
+        column![
+            version_picker_row(app, layout),
+            text_input("Or type a version id", &app.minecraft_version)
+                .on_input(Message::VersionChanged)
+                .padding(12),
+            version_filters(app),
+        ]
+        .spacing(8),
+    );
+
+    let loader = field(
+        "Loader",
+        pick_list(LoaderChoice::ALL, Some(app.loader), Message::LoaderChanged).padding(12),
+    );
+
+    let minecraft_dir = field(
+        "Launcher data directory",
+        text_input("", &app.minecraft_dir)
+            .on_input(Message::MinecraftDirChanged)
+            .padding(12),
+    );
+
+    let source = field(
+        "Source",
+        pick_list(ProjectSource::ALL, Some(app.project_source), Message::ProjectSourceChanged)
+            .padding(12),
+    );
+
+    let kind = field(
+        "Project kind",
+        pick_list(ProjectKind::ALL, Some(app.project_kind), Message::ProjectKindChanged)
+            .padding(12),
+    );
+
+    let query = field(
+        "Search query",
+        text_input("Search mods or modpacks", &app.project_query)
+            .on_input(Message::ProjectQueryChanged)
+            .padding(12),
+    );
+
+    let curseforge_key = if app.project_source == ProjectSource::CurseForge {
+        field(
+            "CurseForge API key",
+            text_input("API key for CurseForge", &app.curseforge_api_key)
+                .on_input(Message::CurseForgeApiKeyChanged)
+                .padding(12),
+        )
+    } else {
+        container(column![]).into()
+    };
+
+    let search_controls = column![
+        responsive_pair(source, kind, layout),
+        query,
+        curseforge_key,
+        row![
+            button("Search")
+                .on_press(Message::SearchProjects)
+                .padding(12)
+                .width(Length::Fill),
+            button("Refresh installed")
+                .on_press(Message::RefreshInstalledProjects)
+                .padding(12)
+                .width(Length::Fill),
+        ]
+        .spacing(12),
+    ]
+    .spacing(16);
+
+    let search_results: Element<'_, Message> = if app.search_loading {
+        text("Searching for projects...").size(14).color([0.78, 0.78, 0.78]).into()
+    } else if !app.search_error.is_empty() {
+        text(&app.search_error).size(14).color([0.95, 0.50, 0.50]).into()
+    } else if app.search_results.is_empty() {
+        text("No search results yet. Use the search box to find mods or modpacks.")
+            .size(14)
+            .color([0.72, 0.76, 0.82])
+            .wrapping(Wrapping::Word)
+            .into()
+    } else {
+        let mut list = column![].spacing(12);
+
+        for project in &app.search_results {
+            let action_button = if app.project_action_busy {
+                button("Working...")
+            } else {
+                button("Install")
+                    .on_press(Message::InstallProjectPressed(project.clone()))
+            }
+            .padding([8, 14]);
+
+            list = list.push(project_card(project, action_button.into()));
+        }
+
+        list.into()
+    };
+
+    let installed_projects: Element<'_, Message> = if app.installed_loading {
+        text("Loading installed mods and modpacks...")
+            .size(14)
+            .color([0.72, 0.76, 0.82])
+            .into()
+    } else if app.installed_projects.is_empty() {
+        text("No installed mods or modpacks found in the selected game directory.")
+            .size(14)
+            .color([0.72, 0.76, 0.82])
+            .into()
+    } else {
+        let mut list = column![].spacing(12);
+
+        for project in &app.installed_projects {
+            let mut actions = row![].spacing(8);
+
+            if project.kind == ProjectKind::Modpack {
+                let launch_button = if app.busy || app.project_action_busy {
+                    button("Working...")
+                } else {
+                    button("Launch Profile")
+                        .on_press(Message::LaunchModpackPressed(project.clone()))
+                }
+                .padding([8, 14]);
+
+                actions = actions.push(launch_button);
+            }
+
+            let uninstall_button = if app.project_action_busy {
+                button("Working...")
+            } else {
+                button("Uninstall")
+                    .on_press(Message::UninstallProjectPressed(project.clone()))
+            }
+            .padding([8, 14]);
+
+            actions = actions.push(uninstall_button);
+            list = list.push(project_card(project, actions.into()));
+        }
+
+        list.into()
+    };
+
+    column![
+        mods_logo,
+        responsive_pair(version, loader, layout),
+        minecraft_dir,
+        rule::horizontal(1),
+        search_controls,
+        rule::horizontal(1),
+        text("Search results").size(18),
+        search_results,
+        rule::horizontal(1),
+        row![text("Installed projects").size(18), if app.installed_loading { text("Refreshing...").size(14) } else { text("").size(14) }]
+            .spacing(12),
+        installed_projects,
+    ]
+    .spacing(layout.spacing())
+    .width(Length::Fill)
+    .into()
+}
+
+fn tab_button(label: &str, tab: Tab, _selected: Tab) -> iced::widget::Button<'_, Message> {
+    button(text(label).size(14))
+        .on_press(Message::TabSelected(tab))
+        .padding([12, 18])
+}
+
+fn project_card<'a>(project: &'a ManagedProject, actions: Element<'a, Message>) -> Element<'a, Message> {
+    container(
+        column![
+            row![
+                column![
+                    text(&project.title).size(16),
+                    text(format!("{} • {}", project.source, project.kind)).size(12).color([0.72, 0.76, 0.82]),
+                ]
+                .width(Length::Fill),
+                actions,
+            ]
+            .spacing(12)
+            .align_y(alignment::Vertical::Center),
+            text(&project.description)
+                .size(14)
+                .color([0.78, 0.78, 0.78])
+                .wrapping(Wrapping::Word),
+            text(format!("Downloads: {}", project.downloads))
+                .size(12)
+                .color([0.72, 0.76, 0.82]),
+        ]
+        .spacing(12),
+    )
+    .padding(12)
+    .width(Length::Fill)
+    .into()
+}
+
+fn search_task(request: ProjectSearchRequest) -> Task<Message> {
+    Task::perform(async move { search_projects(request) }, Message::ProjectsLoaded)
 }
 
 fn launch_task(request: LaunchRequest) -> Task<Message> {
