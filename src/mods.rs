@@ -1,12 +1,11 @@
 use std::{
     fs::{self, File},
+    io,
     path::PathBuf,
 };
 
-use reqwest::{blocking::Client, header, Url};
+use reqwest::{Url, blocking::Client, header};
 use serde::Deserialize;
-use std::io;
-use walkdir::WalkDir;
 use zip::ZipArchive;
 
 use crate::core::LoaderChoice;
@@ -21,6 +20,7 @@ const CURSEFORGE_MODPACKS_CLASS_ID: u32 = 4471;
 pub enum ProjectSource {
     Modrinth,
     CurseForge,
+    Local,
 }
 
 impl ProjectSource {
@@ -32,6 +32,7 @@ impl std::fmt::Display for ProjectSource {
         match self {
             Self::Modrinth => f.write_str("Modrinth"),
             Self::CurseForge => f.write_str("CurseForge"),
+            Self::Local => f.write_str("Local"),
         }
     }
 }
@@ -87,6 +88,8 @@ pub struct ManagedProject {
     pub title: String,
     pub description: String,
     pub downloads: u64,
+    pub installed_path: Option<PathBuf>,
+    pub location_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,15 +113,23 @@ pub fn search_projects(
     match request.source {
         ProjectSource::Modrinth => search_modrinth(request),
         ProjectSource::CurseForge => search_curseforge(request),
+        ProjectSource::Local => Err("Local projects cannot be searched remotely.".to_string()),
     }
 }
 
 pub fn install_project(
     request: InstallProjectRequest,
 ) -> std::result::Result<InstallProjectReport, String> {
+    if request.project.kind == ProjectKind::Mod && request.minecraft_version.trim().is_empty() {
+        return Err("Select a Minecraft version before installing a mod.".to_string());
+    }
+
     let file = match request.project.source {
         ProjectSource::Modrinth => latest_modrinth_file(&request)?,
         ProjectSource::CurseForge => latest_curseforge_file(&request)?,
+        ProjectSource::Local => {
+            return Err("Local projects cannot be installed from a remote source.".to_string());
+        }
     };
 
     let destination_dir = match request.project.kind {
@@ -133,9 +144,9 @@ pub fn install_project(
     fs::create_dir_all(&destination_dir)
         .map_err(|error| format!("Could not create destination directory: {error}"))?;
 
-    // For modpacks we extract ZIP archives into a folder under `modpacks/`.
-    if request.project.kind == ProjectKind::Modpack && file.filename.to_lowercase().ends_with(".zip") {
-        // download to a temporary file
+    if request.project.kind == ProjectKind::Modpack
+        && file.filename.to_lowercase().ends_with(".zip")
+    {
         let tmp_dir = std::env::temp_dir();
         let tmp_path = tmp_dir.join(&file.filename);
         download_file(&file.url, &tmp_path)?;
@@ -148,12 +159,11 @@ pub fn install_project(
 
         let extract_destination = destination_dir.join(&pack_name);
         fs::create_dir_all(&extract_destination)
-            .map_err(|e| format!("Could not create modpack directory: {e}"))?;
+            .map_err(|error| format!("Could not create modpack directory: {error}"))?;
 
         extract_zip(&tmp_path, &extract_destination)
-            .map_err(|e| format!("Could not extract modpack: {e}"))?;
+            .map_err(|error| format!("Could not extract modpack: {error}"))?;
 
-        // remove temp file
         let _ = fs::remove_file(&tmp_path);
 
         return Ok(InstallProjectReport {
@@ -177,7 +187,7 @@ fn extract_zip(zip_path: &PathBuf, destination: &PathBuf) -> std::result::Result
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let outpath = destination.join(entry.sanitized_name());
+        let outpath = destination.join(entry.mangled_name());
 
         if entry.is_dir() {
             fs::create_dir_all(&outpath)?;
@@ -185,6 +195,7 @@ fn extract_zip(zip_path: &PathBuf, destination: &PathBuf) -> std::result::Result
             if let Some(parent) = outpath.parent() {
                 fs::create_dir_all(parent)?;
             }
+
             let mut outfile = File::create(&outpath)?;
             io::copy(&mut entry, &mut outfile)?;
         }
@@ -197,83 +208,118 @@ fn extract_zip(zip_path: &PathBuf, destination: &PathBuf) -> std::result::Result
 pub fn list_installed_projects(minecraft_dir: &PathBuf) -> Vec<ManagedProject> {
     let mut projects = Vec::new();
 
-    // Scan modpacks directory
     let modpacks_dir = minecraft_dir.join("modpacks");
-    if modpacks_dir.exists() {
-        for entry in WalkDir::new(&modpacks_dir).min_depth(1).max_depth(2) {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        projects.push(ManagedProject {
-                            source: ProjectSource::Modrinth,
-                            kind: ProjectKind::Modpack,
-                            id: name.to_string(),
-                            title: name.to_string(),
-                            description: String::new(),
-                            downloads: 0,
-                        });
-                    }
-                } else if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        if ext.eq_ignore_ascii_case("zip") {
-                            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                                projects.push(ManagedProject {
-                                    source: ProjectSource::Modrinth,
-                                    kind: ProjectKind::Modpack,
-                                    id: name.to_string(),
-                                    title: name.to_string(),
-                                    description: String::new(),
-                                    downloads: 0,
-                                });
-                            }
-                        }
-                    }
+    if let Ok(entries) = fs::read_dir(&modpacks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|segment| segment.to_str()) {
+                    projects.push(ManagedProject {
+                        source: ProjectSource::Local,
+                        kind: ProjectKind::Modpack,
+                        id: name.to_string(),
+                        title: name.to_string(),
+                        description: String::new(),
+                        downloads: 0,
+                        installed_path: Some(path),
+                        location_hint: Some("Profile directory".to_string()),
+                    });
                 }
             }
         }
     }
 
-    // Scan versions/*/mods
     let versions_dir = minecraft_dir.join("versions");
-    if versions_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&versions_dir) {
-            for entry in entries.flatten() {
-                let ver_path = entry.path();
-                if ver_path.is_dir() {
-                    let mods_path = ver_path.join("mods");
-                    if mods_path.exists() {
-                        if let Ok(mod_entries) = fs::read_dir(&mods_path) {
-                            for m in mod_entries.flatten() {
-                                let p = m.path();
-                                if p.is_file() {
-                                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                                        projects.push(ManagedProject {
-                                            source: ProjectSource::Modrinth,
-                                            kind: ProjectKind::Mod,
-                                            id: name.to_string(),
-                                            title: name.to_string(),
-                                            description: String::new(),
-                                            downloads: 0,
-                                        });
-                                    }
-                                }
-                            }
-                        }
+    if let Ok(entries) = fs::read_dir(&versions_dir) {
+        for entry in entries.flatten() {
+            let version_path = entry.path();
+            if !version_path.is_dir() {
+                continue;
+            }
+
+            let Some(version_name) = version_path
+                .file_name()
+                .and_then(|segment| segment.to_str())
+            else {
+                continue;
+            };
+
+            let mods_path = version_path.join("mods");
+            if let Ok(mod_entries) = fs::read_dir(&mods_path) {
+                for mod_entry in mod_entries.flatten() {
+                    let path = mod_entry.path();
+                    if !path.is_file() {
+                        continue;
                     }
+
+                    let Some(filename) = path.file_name().and_then(|segment| segment.to_str())
+                    else {
+                        continue;
+                    };
+
+                    let title = path
+                        .file_stem()
+                        .and_then(|segment| segment.to_str())
+                        .unwrap_or(filename)
+                        .to_string();
+
+                    projects.push(ManagedProject {
+                        source: ProjectSource::Local,
+                        kind: ProjectKind::Mod,
+                        id: filename.to_string(),
+                        title,
+                        description: filename.to_string(),
+                        downloads: 0,
+                        installed_path: Some(path),
+                        location_hint: Some(format!("Version profile: {version_name}")),
+                    });
                 }
             }
         }
     }
+
+    projects.sort_by(|left, right| {
+        kind_sort_rank(left.kind)
+            .cmp(&kind_sort_rank(right.kind))
+            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+            .then_with(|| {
+                left.location_hint
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.location_hint.as_deref().unwrap_or_default())
+            })
+    });
 
     projects
 }
 
 /// Uninstalls a managed project by removing files or directories from the minecraft directory.
-pub fn uninstall_project(project: &ManagedProject, minecraft_dir: &PathBuf) -> std::result::Result<(), String> {
+pub fn uninstall_project(
+    project: &ManagedProject,
+    minecraft_dir: &PathBuf,
+) -> std::result::Result<(), String> {
+    if let Some(path) = project.installed_path.as_ref() {
+        if !path.exists() {
+            return Err(format!(
+                "The installed item no longer exists at {}.",
+                path.display()
+            ));
+        }
+
+        if path.is_dir() {
+            fs::remove_dir_all(path)
+                .map_err(|error| format!("Could not remove project directory: {error}"))?;
+        } else {
+            fs::remove_file(path)
+                .map_err(|error| format!("Could not remove project file: {error}"))?;
+        }
+
+        return Ok(());
+    }
+
     match project.kind {
         ProjectKind::Mod => {
-            // Try removing from versions/*/mods
             let versions_dir = minecraft_dir.join("versions");
             if versions_dir.exists() {
                 if let Ok(entries) = fs::read_dir(&versions_dir) {
@@ -282,7 +328,7 @@ pub fn uninstall_project(project: &ManagedProject, minecraft_dir: &PathBuf) -> s
                         let candidate = mods_path.join(&project.id);
                         if candidate.exists() {
                             fs::remove_file(&candidate)
-                                .map_err(|e| format!("Could not remove mod file: {e}"))?;
+                                .map_err(|error| format!("Could not remove mod file: {error}"))?;
                         }
                     }
                 }
@@ -292,12 +338,13 @@ pub fn uninstall_project(project: &ManagedProject, minecraft_dir: &PathBuf) -> s
             let modpacks_dir = minecraft_dir.join("modpacks");
             let folder = modpacks_dir.join(&project.id);
             if folder.exists() {
-                fs::remove_dir_all(&folder).map_err(|e| format!("Could not remove modpack: {e}"))?;
+                fs::remove_dir_all(&folder)
+                    .map_err(|error| format!("Could not remove modpack: {error}"))?;
             } else {
-                // maybe it's a zip file
                 let zip_file = modpacks_dir.join(format!("{}.zip", project.id));
                 if zip_file.exists() {
-                    fs::remove_file(&zip_file).map_err(|e| format!("Could not remove modpack zip: {e}"))?;
+                    fs::remove_file(&zip_file)
+                        .map_err(|error| format!("Could not remove modpack zip: {error}"))?;
                 }
             }
         }
@@ -310,10 +357,16 @@ fn search_modrinth(
     request: ProjectSearchRequest,
 ) -> std::result::Result<Vec<ManagedProject>, String> {
     let client = http_client()?;
-    let mut facets = vec![format!(r#"["project_type:{}"]"#, request.kind.modrinth_type())];
+    let mut facets = vec![format!(
+        r#"["project_type:{}"]"#,
+        request.kind.modrinth_type()
+    )];
 
     if !request.minecraft_version.trim().is_empty() {
-        facets.push(format!(r#"["versions:{}"]"#, request.minecraft_version.trim()));
+        facets.push(format!(
+            r#"["versions:{}"]"#,
+            request.minecraft_version.trim()
+        ));
     }
 
     if let Some(loader) = modrinth_loader(request.loader) {
@@ -351,6 +404,8 @@ fn search_modrinth(
             title: project.title,
             description: project.description,
             downloads: project.downloads,
+            installed_path: None,
+            location_hint: None,
         })
         .collect())
 }
@@ -396,6 +451,8 @@ fn search_curseforge(
             title: project.name,
             description: project.summary.unwrap_or_default(),
             downloads: project.download_count.unwrap_or_default() as u64,
+            installed_path: None,
+            location_hint: None,
         })
         .collect())
 }
@@ -419,7 +476,7 @@ fn latest_modrinth_file(
 
     let version_url = format!("{MODRINTH_API}/project/{}/version", request.project.id);
     let url = Url::parse_with_params(version_url.as_str(), &query)
-    .map_err(|error| format!("Modrinth version URL invalid: {error}"))?;
+        .map_err(|error| format!("Modrinth version URL invalid: {error}"))?;
 
     let versions: Vec<ModrinthVersion> = client
         .get(url)
@@ -460,7 +517,7 @@ fn latest_curseforge_file(
 
     let files_url = format!("{CURSEFORGE_API}/v1/mods/{}/files", request.project.id);
     let url = Url::parse_with_params(files_url.as_str(), &query)
-    .map_err(|error| format!("CurseForge file list URL invalid: {error}"))?;
+        .map_err(|error| format!("CurseForge file list URL invalid: {error}"))?;
 
     let response: CurseForgeFilesResponse = client
         .get(url)
@@ -474,8 +531,14 @@ fn latest_curseforge_file(
     let file = response
         .data
         .into_iter()
-        .find(|file| file.download_url.as_deref().is_some_and(|url| !url.is_empty()))
-        .ok_or_else(|| "No direct CurseForge download URL was available for this project.".to_string())?;
+        .find(|file| {
+            file.download_url
+                .as_deref()
+                .is_some_and(|url| !url.is_empty())
+        })
+        .ok_or_else(|| {
+            "No direct CurseForge download URL was available for this project.".to_string()
+        })?;
 
     Ok(RemoteFile {
         filename: file.file_name,
@@ -507,7 +570,10 @@ fn http_client() -> std::result::Result<Client, String> {
         .user_agent(user_agent)
         .default_headers({
             let mut headers = header::HeaderMap::new();
-            headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
+            headers.insert(
+                header::ACCEPT,
+                header::HeaderValue::from_static("application/json"),
+            );
             headers
         })
         .build()
@@ -531,6 +597,13 @@ fn modrinth_loader(loader: LoaderChoice) -> Option<&'static str> {
         LoaderChoice::Quilt => Some("quilt"),
         LoaderChoice::Forge => Some("forge"),
         LoaderChoice::NeoForge => Some("neoforge"),
+    }
+}
+
+fn kind_sort_rank(kind: ProjectKind) -> u8 {
+    match kind {
+        ProjectKind::Mod => 0,
+        ProjectKind::Modpack => 1,
     }
 }
 
@@ -567,22 +640,8 @@ struct ModrinthFile {
 }
 
 #[derive(Debug, Deserialize)]
-struct ModrinthProjectDetail {
-    #[serde(alias = "project_id", alias = "id")]
-    project_id: String,
-    title: String,
-    description: String,
-    downloads: u64,
-}
-
-#[derive(Debug, Deserialize)]
 struct CurseForgeSearchResponse {
     data: Vec<CurseForgeProject>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CurseForgeProjectResponse {
-    data: CurseForgeProject,
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,65 +663,4 @@ struct CurseForgeFilesResponse {
 struct CurseForgeFile {
     file_name: String,
     download_url: Option<String>,
-}
-
-/// Fetches richer project details for display in the UI.
-pub fn fetch_project_details(
-    source: ProjectSource,
-    id: &str,
-    curseforge_api_key: &str,
-) -> std::result::Result<ManagedProject, String> {
-    match source {
-        ProjectSource::Modrinth => get_modrinth_project(id),
-        ProjectSource::CurseForge => get_curseforge_project(id, curseforge_api_key),
-    }
-}
-
-fn get_modrinth_project(id: &str) -> std::result::Result<ManagedProject, String> {
-    let client = http_client()?;
-
-    let project: ModrinthProjectDetail = client
-        .get(format!("{MODRINTH_API}/project/{id}"))
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("Modrinth project fetch failed: {e}"))?
-        .json()
-        .map_err(|e| format!("Could not parse Modrinth project: {e}"))?;
-
-    Ok(ManagedProject {
-        source: ProjectSource::Modrinth,
-        kind: ProjectKind::Mod,
-        id: project.project_id,
-        title: project.title,
-        description: project.description,
-        downloads: project.downloads,
-    })
-}
-
-fn get_curseforge_project(
-    id: &str,
-    api_key: &str,
-) -> std::result::Result<ManagedProject, String> {
-    let api_key = require_curseforge_key(api_key)?;
-    let client = http_client()?;
-
-    let response: CurseForgeProjectResponse = client
-        .get(format!("{CURSEFORGE_API}/v1/mods/{id}"))
-        .header("x-api-key", api_key)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("CurseForge project fetch failed: {e}"))?
-        .json()
-        .map_err(|e| format!("Could not parse CurseForge project: {e}"))?;
-
-    let project = response.data;
-
-    Ok(ManagedProject {
-        source: ProjectSource::CurseForge,
-        kind: ProjectKind::Mod,
-        id: project.id.to_string(),
-        title: project.name,
-        description: project.summary.unwrap_or_default(),
-        downloads: project.download_count.unwrap_or_default() as u64,
-    })
 }

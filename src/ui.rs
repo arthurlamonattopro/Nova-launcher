@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use iced::{
-    Element, Length, Size, Task, Theme, alignment,
+    Background, Border, Color, Element, Length, Size, Task, Theme, alignment,
     futures::channel::mpsc,
     widget::{
         button, checkbox, column, container, pick_list, progress_bar, responsive, row, rule,
@@ -15,9 +15,8 @@ use crate::core::{
     default_minecraft_dir, launch_with_progress, list_versions,
 };
 use crate::mods::{
-    install_project, list_installed_projects, search_projects, uninstall_project,
-    InstallProjectReport, InstallProjectRequest, ManagedProject, ProjectKind,
-    ProjectSearchRequest, ProjectSource,
+    InstallProjectReport, InstallProjectRequest, ManagedProject, ProjectKind, ProjectSearchRequest,
+    ProjectSource, install_project, list_installed_projects, search_projects, uninstall_project,
 };
 
 #[derive(Debug, Clone)]
@@ -75,6 +74,7 @@ pub struct NovaLauncher {
     minecraft_dir: String,
     memory_mb: u16,
     status: String,
+    status_is_error: bool,
     progress_percent: f32,
     busy: bool,
     tab: Tab,
@@ -106,6 +106,7 @@ impl Default for NovaLauncher {
             minecraft_dir: default_minecraft_dir().display().to_string(),
             memory_mb: 2048,
             status: "Loading Minecraft versions...".to_string(),
+            status_is_error: false,
             progress_percent: 0.0,
             busy: false,
             tab: Tab::Launcher,
@@ -125,10 +126,10 @@ impl Default for NovaLauncher {
 
 pub fn run() -> iced::Result {
     iced::application(boot, update, view)
-        .title("NovaLauncher")
+        .title("Nova Launcher")
         .theme(Theme::Dark)
         .window(window::Settings {
-            size: Size::new(820.0, 640.0),
+            size: Size::new(860.0, 660.0),
             min_size: Some(Size::new(360.0, 480.0)),
             ..Default::default()
         })
@@ -139,10 +140,13 @@ pub fn run() -> iced::Result {
 fn boot() -> (NovaLauncher, Task<Message>) {
     (
         NovaLauncher::default(),
-        Task::perform(async {
-            let installed = list_installed_projects(&default_minecraft_dir());
-            list_versions().map(|versions| (versions, installed))
-        }, Message::InitialDataLoaded),
+        Task::perform(
+            async {
+                let installed = list_installed_projects(&default_minecraft_dir());
+                list_versions().map(|versions| (versions, installed))
+            },
+            Message::InitialDataLoaded,
+        ),
     )
 }
 
@@ -161,6 +165,7 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
             }
 
             app.versions_loading = true;
+            app.status_is_error = false;
             app.status = "Refreshing Minecraft versions...".to_string();
 
             return Task::perform(async { list_versions() }, Message::VersionsLoaded);
@@ -181,9 +186,11 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
 
                     let count = versions.len();
                     app.versions = versions;
+                    app.status_is_error = false;
                     app.status = format!("Loaded {count} Minecraft versions.");
                 }
                 Err(error) => {
+                    app.status_is_error = true;
                     app.status = error;
                 }
             }
@@ -205,9 +212,11 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
 
                     app.versions = versions;
                     app.installed_projects = installed;
-                    app.status = format!("Loaded Minecraft versions and installed projects.");
+                    app.status_is_error = false;
+                    app.status = "Ready.".to_string();
                 }
                 Err(error) => {
+                    app.status_is_error = true;
                     app.status = error;
                 }
             }
@@ -218,12 +227,15 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
 
             match result {
                 Ok(projects) => {
+                    let count = projects.len();
                     app.search_results = projects;
-                    app.status = format!("Loaded {} search results.", app.search_results.len());
+                    app.status_is_error = false;
+                    app.status = format!("Found {count} result(s).");
                 }
                 Err(error) => {
-                    app.search_error = error;
-                    app.status = "Search failed.".to_string();
+                    app.search_error = error.clone();
+                    app.status_is_error = true;
+                    app.status = error;
                 }
             }
         }
@@ -233,6 +245,7 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
             }
 
             app.project_action_busy = true;
+            app.status_is_error = false;
             app.status = format!("Installing {}...", project.title);
 
             let request = InstallProjectRequest {
@@ -243,26 +256,28 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
                 curseforge_api_key: app.curseforge_api_key.clone(),
             };
 
-            return Task::perform(async move { install_project(request) }, Message::InstallProjectResult);
+            return Task::perform(
+                async move { install_project(request) },
+                Message::InstallProjectResult,
+            );
         }
         Message::InstallProjectResult(result) => {
             app.project_action_busy = false;
 
             match result {
                 Ok(report) => {
-                    app.status = format!(
-                        "Installed {} to {}.",
-                        report.filename,
-                        report.destination.display()
-                    );
+                    app.status_is_error = false;
+                    app.status = format!("Installed {}.", report.filename);
 
                     let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
                     app.installed_loading = true;
-                    return Task::perform(async move {
-                        list_installed_projects(&minecraft_dir)
-                    }, Message::InstalledProjectsLoaded);
+                    return Task::perform(
+                        async move { list_installed_projects(&minecraft_dir) },
+                        Message::InstalledProjectsLoaded,
+                    );
                 }
                 Err(error) => {
+                    app.status_is_error = true;
                     app.status = error;
                 }
             }
@@ -273,15 +288,20 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
             }
 
             app.installed_loading = true;
+            app.status_is_error = false;
             app.status = "Refreshing installed projects...".to_string();
             let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
 
-            return Task::perform(async move { list_installed_projects(&minecraft_dir) }, Message::InstalledProjectsLoaded);
+            return Task::perform(
+                async move { list_installed_projects(&minecraft_dir) },
+                Message::InstalledProjectsLoaded,
+            );
         }
         Message::InstalledProjectsLoaded(installed) => {
             app.installed_loading = false;
             app.installed_projects = installed;
-            app.status = format!("Loaded {} installed items.", app.installed_projects.len());
+            app.status_is_error = false;
+            app.status = format!("{} installed item(s).", app.installed_projects.len());
         }
         Message::UninstallProjectPressed(project) => {
             if app.project_action_busy {
@@ -289,24 +309,31 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
             }
 
             app.project_action_busy = true;
+            app.status_is_error = false;
             app.status = format!("Removing {}...", project.title);
             let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
 
-            return Task::perform(async move { uninstall_project(&project, &minecraft_dir) }, Message::UninstallProjectResult);
+            return Task::perform(
+                async move { uninstall_project(&project, &minecraft_dir) },
+                Message::UninstallProjectResult,
+            );
         }
         Message::UninstallProjectResult(result) => {
             app.project_action_busy = false;
 
             match result {
                 Ok(()) => {
-                    app.status = "Project removed successfully.".to_string();
+                    app.status_is_error = false;
+                    app.status = "Removed successfully.".to_string();
                     let minecraft_dir = PathBuf::from(app.minecraft_dir.trim());
                     app.installed_loading = true;
-                    return Task::perform(async move {
-                        list_installed_projects(&minecraft_dir)
-                    }, Message::InstalledProjectsLoaded);
+                    return Task::perform(
+                        async move { list_installed_projects(&minecraft_dir) },
+                        Message::InstalledProjectsLoaded,
+                    );
                 }
                 Err(error) => {
+                    app.status_is_error = true;
                     app.status = error;
                 }
             }
@@ -323,9 +350,17 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
                 return Task::none();
             }
 
+            if app.project_query.trim().is_empty() {
+                app.search_error = "Enter a search query to find mods or modpacks.".to_string();
+                app.status_is_error = true;
+                app.status = "Search query required.".to_string();
+                return Task::none();
+            }
+
             app.search_loading = true;
             app.search_error.clear();
-            app.status = "Searching mods and modpacks...".to_string();
+            app.status_is_error = false;
+            app.status = "Searching...".to_string();
 
             let request = ProjectSearchRequest {
                 source: app.project_source,
@@ -349,7 +384,8 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
 
             app.busy = true;
             app.progress_percent = 0.0;
-            app.status = "Starting install and launch workflow...".to_string();
+            app.status_is_error = false;
+            app.status = "Starting launch...".to_string();
 
             let request = LaunchRequest {
                 minecraft_dir: PathBuf::from(app.minecraft_dir.trim()),
@@ -367,18 +403,25 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
                 return Task::none();
             }
 
-            let modpack_dir = PathBuf::from(app.minecraft_dir.trim())
-                .join("modpacks")
-                .join(&project.id);
+            let modpack_dir = project.installed_path.clone().unwrap_or_else(|| {
+                PathBuf::from(app.minecraft_dir.trim())
+                    .join("modpacks")
+                    .join(&project.id)
+            });
 
-            if !modpack_dir.exists() {
-                app.status = format!("Modpack profile directory not found: {}", modpack_dir.display());
+            if !modpack_dir.is_dir() {
+                app.status_is_error = true;
+                app.status = format!(
+                    "Modpack profile directory not found: {}",
+                    modpack_dir.display()
+                );
                 return Task::none();
             }
 
             app.busy = true;
             app.progress_percent = 0.0;
-            app.status = format!("Launching modpack profile {}...", project.title);
+            app.status_is_error = false;
+            app.status = format!("Launching {}...", project.title);
 
             let request = LaunchRequest {
                 minecraft_dir: modpack_dir,
@@ -394,23 +437,24 @@ fn update(app: &mut NovaLauncher, message: Message) -> Task<Message> {
         Message::LaunchEvent(event) => match event {
             LaunchProgress::Progress { label, percent } => {
                 app.progress_percent = percent.clamp(0.0, 100.0);
+                app.status_is_error = false;
                 app.status = label;
             }
             LaunchProgress::Finished(result) => {
                 app.busy = false;
-                app.status = match result {
+                match result {
                     Ok(report) => {
                         app.progress_percent = 100.0;
-                        format!(
-                            "Launched {} successfully. Java process id: {}.",
-                            report.version_id, report.pid
-                        )
+                        app.status_is_error = false;
+                        app.status =
+                            format!("Launched {} (pid {}).", report.version_id, report.pid);
                     }
                     Err(error) => {
                         app.progress_percent = 0.0;
-                        error
+                        app.status_is_error = true;
+                        app.status = error;
                     }
-                };
+                }
             }
         },
     }
@@ -424,37 +468,62 @@ fn view(app: &NovaLauncher) -> Element<'_, Message> {
 
 fn view_responsive(app: &NovaLauncher, size: Size) -> Element<'_, Message> {
     let layout = LayoutMode::from_width(size.width);
-    let title = text("NovaLauncher").size(36);
-    let subtitle = text("Offline Minecraft launcher powered by iced and mc-launcher-core.")
-        .size(16)
-        .wrapping(Wrapping::Word)
-        .color([0.72, 0.76, 0.82]);
 
-    let tabs = row![
+    // Title and tab bar share a row when there is enough horizontal space.
+    let title_col = column![
+        text("Nova Launcher").size(26),
+        text("Offline Minecraft launcher")
+            .size(12)
+            .color([0.52, 0.58, 0.70]),
+    ]
+    .spacing(3)
+    .width(Length::Fill);
+
+    let tab_bar = row![
         tab_button("Launcher", Tab::Launcher, app.tab),
         tab_button("Mods & Modpacks", Tab::Mods, app.tab),
     ]
-    .spacing(12);
+    .spacing(6);
+
+    let header: Element<'_, Message> = if layout.is_narrow() {
+        column![title_col, tab_bar].spacing(12).into()
+    } else {
+        row![title_col, tab_bar]
+            .align_y(alignment::Vertical::Center)
+            .spacing(12)
+            .into()
+    };
 
     let body = match app.tab {
         Tab::Launcher => launcher_body(app, layout),
         Tab::Mods => mods_body(app, layout),
     };
 
+    // Status bar: colour and icon reflect current state.
+    let (status_color, status_icon): (Color, &str) = if app.busy || app.project_action_busy {
+        (Color::from_rgb(0.95, 0.85, 0.45), "⟳  ")
+    } else if app.status_is_error {
+        (Color::from_rgb(0.95, 0.50, 0.50), "✕  ")
+    } else {
+        (Color::from_rgb(0.50, 0.84, 0.62), "✓  ")
+    };
+
+    let status_bar = row![
+        text(status_icon).size(13).color(status_color),
+        text(&app.status)
+            .size(13)
+            .wrapping(Wrapping::Word)
+            .color(status_color),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+
     let content = column![
-        title,
-        subtitle,
-        tabs,
+        header,
         rule::horizontal(1),
         body,
-        text(&app.status)
-            .size(14)
-            .wrapping(Wrapping::Word)
-            .color(if app.busy || app.project_action_busy {
-                [0.84, 0.78, 0.48]
-            } else {
-                [0.62, 0.82, 0.70]
-            }),
+        rule::horizontal(1),
+        status_bar,
     ]
     .spacing(layout.spacing())
     .padding(layout.padding())
@@ -494,7 +563,9 @@ fn launcher_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message>
     );
 
     let memory = column![
-        text(format!("Memory: {} MB", app.memory_mb)).size(14),
+        text(format!("Memory  —  {} MB", app.memory_mb))
+            .size(12)
+            .color([0.62, 0.68, 0.78]),
         slider(512..=8192, app.memory_mb, Message::MemoryChanged).step(256u16),
     ]
     .spacing(8);
@@ -513,24 +584,43 @@ fn launcher_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message>
             .padding(12),
     );
 
+    // Show the target version in the button label when one is selected.
+    let version_str = app.minecraft_version.trim();
+    let launch_label = if version_str.is_empty() {
+        "Install & Launch".to_string()
+    } else {
+        format!("Install & Launch  {version_str}")
+    };
+
     let launch_button = if app.busy {
         button(text("Working...").align_x(alignment::Horizontal::Center))
     } else {
-        button(text("Install and Launch").align_x(alignment::Horizontal::Center))
+        button(text(launch_label).align_x(alignment::Horizontal::Center))
             .on_press(Message::LaunchPressed)
     }
-    .padding([12, 18])
+    .padding([14, 20])
     .width(Length::Fill);
 
-    let progress = column![
-        row![
-            text("Progress").size(14),
-            text(format!("{:.0}%", app.progress_percent)).size(14),
+    // Only render the progress section when a launch is active or has just finished.
+    let progress: Element<'_, Message> = if app.busy || app.progress_percent > 0.0 {
+        column![
+            row![
+                text("Progress")
+                    .size(12)
+                    .color([0.62, 0.68, 0.78])
+                    .width(Length::Fill),
+                text(format!("{:.0}%", app.progress_percent))
+                    .size(12)
+                    .color([0.62, 0.68, 0.78]),
+            ]
+            .spacing(8),
+            progress_bar(0.0..=100.0, app.progress_percent),
         ]
-        .spacing(12),
-        progress_bar(0.0..=100.0, app.progress_percent),
-    ]
-    .spacing(8);
+        .spacing(6)
+        .into()
+    } else {
+        column![].into()
+    };
 
     let identity = responsive_pair(username, version, layout);
     let runtime = responsive_pair(loader, memory.into(), layout);
@@ -549,19 +639,6 @@ fn launcher_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message>
 }
 
 fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
-    let mods_logo = row![
-        container(text("🧩").size(32)).padding(10),
-        column![
-            text("Mods & Modpacks").size(24),
-            text("Browse, install, and manage your modded Minecraft setup.")
-                .size(14)
-                .color([0.78, 0.78, 0.78])
-                .wrapping(Wrapping::Word),
-        ]
-    ]
-    .spacing(12)
-    .align_y(alignment::Vertical::Center);
-
     let version = field(
         "Minecraft version",
         column![
@@ -588,70 +665,101 @@ fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
 
     let source = field(
         "Source",
-        pick_list(ProjectSource::ALL, Some(app.project_source), Message::ProjectSourceChanged)
-            .padding(12),
+        pick_list(
+            ProjectSource::ALL,
+            Some(app.project_source),
+            Message::ProjectSourceChanged,
+        )
+        .padding(12),
     );
 
     let kind = field(
-        "Project kind",
-        pick_list(ProjectKind::ALL, Some(app.project_kind), Message::ProjectKindChanged)
-            .padding(12),
+        "Type",
+        pick_list(
+            ProjectKind::ALL,
+            Some(app.project_kind),
+            Message::ProjectKindChanged,
+        )
+        .padding(12),
     );
 
+    // Enter key submits the search.
     let query = field(
         "Search query",
-        text_input("Search mods or modpacks", &app.project_query)
+        text_input("Search mods or modpacks...", &app.project_query)
             .on_input(Message::ProjectQueryChanged)
+            .on_submit(Message::SearchProjects)
             .padding(12),
     );
 
+    // Mask the API key so it is not shown in plain text.
     let curseforge_key = if app.project_source == ProjectSource::CurseForge {
         field(
             "CurseForge API key",
-            text_input("API key for CurseForge", &app.curseforge_api_key)
+            text_input("Paste your API key here", &app.curseforge_api_key)
                 .on_input(Message::CurseForgeApiKeyChanged)
+                .secure(true)
                 .padding(12),
         )
     } else {
         container(column![]).into()
     };
 
+    let search_btn = if app.search_loading {
+        button(text("Searching...").align_x(alignment::Horizontal::Center))
+    } else {
+        button(text("Search").align_x(alignment::Horizontal::Center))
+            .on_press(Message::SearchProjects)
+    }
+    .padding(12)
+    .width(Length::Fill);
+
+    let refresh_btn = if app.installed_loading {
+        button(text("Refreshing...").align_x(alignment::Horizontal::Center))
+    } else {
+        button(text("Refresh installed").align_x(alignment::Horizontal::Center))
+            .on_press(Message::RefreshInstalledProjects)
+    }
+    .padding(12)
+    .width(Length::Fill);
+
     let search_controls = column![
         responsive_pair(source, kind, layout),
         query,
         curseforge_key,
-        row![
-            button("Search")
-                .on_press(Message::SearchProjects)
-                .padding(12)
-                .width(Length::Fill),
-            button("Refresh installed")
-                .on_press(Message::RefreshInstalledProjects)
-                .padding(12)
-                .width(Length::Fill),
-        ]
-        .spacing(12),
+        row![search_btn, refresh_btn].spacing(12),
     ]
     .spacing(16);
 
+    // Section headers include counts once data is available.
+    let search_header = format!("Search results  ({})", app.search_results.len());
+    let installed_header = format!("Installed  ({})", app.installed_projects.len());
+
     let search_results: Element<'_, Message> = if app.search_loading {
-        text("Searching for projects...").size(14).color([0.78, 0.78, 0.78]).into()
-    } else if !app.search_error.is_empty() {
-        text(&app.search_error).size(14).color([0.95, 0.50, 0.50]).into()
-    } else if app.search_results.is_empty() {
-        text("No search results yet. Use the search box to find mods or modpacks.")
+        text("Searching for projects...")
             .size(14)
-            .color([0.72, 0.76, 0.82])
+            .color([0.62, 0.68, 0.78])
+            .into()
+    } else if !app.search_error.is_empty() {
+        text(&app.search_error)
+            .size(14)
+            .color([0.95, 0.50, 0.50])
+            .wrapping(Wrapping::Word)
+            .into()
+    } else if app.search_results.is_empty() {
+        text("No results yet — type a query and press Search or Enter.")
+            .size(13)
+            .color([0.52, 0.58, 0.70])
             .wrapping(Wrapping::Word)
             .into()
     } else {
-        let mut list = column![].spacing(12);
+        let mut list = column![].spacing(10);
 
         for project in &app.search_results {
             let action_button = if app.project_action_busy {
-                button("Working...")
+                button(text("Working...").size(13))
             } else {
-                button("Install")
+                button(text("Install").size(13))
                     .on_press(Message::InstallProjectPressed(project.clone()))
             }
             .padding([8, 14]);
@@ -664,25 +772,26 @@ fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
 
     let installed_projects: Element<'_, Message> = if app.installed_loading {
         text("Loading installed mods and modpacks...")
-            .size(14)
-            .color([0.72, 0.76, 0.82])
+            .size(13)
+            .color([0.52, 0.58, 0.70])
             .into()
     } else if app.installed_projects.is_empty() {
-        text("No installed mods or modpacks found in the selected game directory.")
-            .size(14)
-            .color([0.72, 0.76, 0.82])
+        text("No installed mods or modpacks found in the selected directory.")
+            .size(13)
+            .color([0.52, 0.58, 0.70])
+            .wrapping(Wrapping::Word)
             .into()
     } else {
-        let mut list = column![].spacing(12);
+        let mut list = column![].spacing(10);
 
         for project in &app.installed_projects {
             let mut actions = row![].spacing(8);
 
             if project.kind == ProjectKind::Modpack {
                 let launch_button = if app.busy || app.project_action_busy {
-                    button("Working...")
+                    button(text("Working...").size(13))
                 } else {
-                    button("Launch Profile")
+                    button(text("Launch").size(13))
                         .on_press(Message::LaunchModpackPressed(project.clone()))
                 }
                 .padding([8, 14]);
@@ -691,9 +800,9 @@ fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
             }
 
             let uninstall_button = if app.project_action_busy {
-                button("Working...")
+                button(text("Working...").size(13))
             } else {
-                button("Uninstall")
+                button(text("Remove").size(13))
                     .on_press(Message::UninstallProjectPressed(project.clone()))
             }
             .padding([8, 14]);
@@ -706,17 +815,15 @@ fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
     };
 
     column![
-        mods_logo,
         responsive_pair(version, loader, layout),
         minecraft_dir,
         rule::horizontal(1),
         search_controls,
         rule::horizontal(1),
-        text("Search results").size(18),
+        text(search_header).size(16),
         search_results,
         rule::horizontal(1),
-        row![text("Installed projects").size(18), if app.installed_loading { text("Refreshing...").size(14) } else { text("").size(14) }]
-            .spacing(12),
+        text(installed_header).size(16),
         installed_projects,
     ]
     .spacing(layout.spacing())
@@ -724,42 +831,116 @@ fn mods_body(app: &NovaLauncher, layout: LayoutMode) -> Element<'_, Message> {
     .into()
 }
 
-fn tab_button(label: &str, tab: Tab, _selected: Tab) -> iced::widget::Button<'_, Message> {
+/// A tab button that visually highlights the currently active tab.
+fn tab_button(label: &str, tab: Tab, selected: Tab) -> iced::widget::Button<'_, Message> {
+    let is_active = tab == selected;
+
     button(text(label).size(14))
         .on_press(Message::TabSelected(tab))
-        .padding([12, 18])
+        .padding([9, 18])
+        .style(move |theme: &Theme, status| {
+            let palette = theme.palette();
+            if is_active {
+                iced::widget::button::Style {
+                    background: Some(Background::Color(palette.primary)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            } else {
+                let hovered = matches!(
+                    status,
+                    iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+                );
+                iced::widget::button::Style {
+                    background: if hovered {
+                        Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.07)))
+                    } else {
+                        None
+                    },
+                    text_color: Color {
+                        a: if hovered { 1.0 } else { 0.62 },
+                        ..palette.text
+                    },
+                    border: Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            }
+        })
 }
 
-fn project_card<'a>(project: &'a ManagedProject, actions: Element<'a, Message>) -> Element<'a, Message> {
-    container(
-        column![
-            row![
-                column![
-                    text(&project.title).size(16),
-                    text(format!("{} • {}", project.source, project.kind)).size(12).color([0.72, 0.76, 0.82]),
-                ]
-                .width(Length::Fill),
-                actions,
+/// A card displaying project metadata with a subtle bordered background.
+fn project_card<'a>(
+    project: &'a ManagedProject,
+    actions: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let mut details = column![
+        row![
+            column![
+                text(&project.title).size(15),
+                text(format!("{} • {}", project.source, project.kind))
+                    .size(11)
+                    .color([0.55, 0.62, 0.76]),
             ]
-            .spacing(12)
-            .align_y(alignment::Vertical::Center),
-            text(&project.description)
-                .size(14)
-                .color([0.78, 0.78, 0.78])
-                .wrapping(Wrapping::Word),
-            text(format!("Downloads: {}", project.downloads))
-                .size(12)
-                .color([0.72, 0.76, 0.82]),
+            .spacing(2)
+            .width(Length::Fill),
+            actions,
         ]
-        .spacing(12),
-    )
-    .padding(12)
-    .width(Length::Fill)
-    .into()
+        .spacing(12)
+        .align_y(alignment::Vertical::Center),
+    ]
+    .spacing(6);
+
+    if !project.description.trim().is_empty() {
+        details = details.push(
+            text(&project.description)
+                .size(13)
+                .color([0.70, 0.75, 0.84])
+                .wrapping(Wrapping::Word),
+        );
+    }
+
+    // Compact single-line metadata row: location hint + download count.
+    let mut meta: Vec<String> = Vec::new();
+
+    if let Some(hint) = project.location_hint.as_deref() {
+        meta.push(hint.to_string());
+    }
+
+    if project.downloads > 0 {
+        meta.push(format!("↓ {}", format_downloads(project.downloads)));
+    }
+
+    if !meta.is_empty() {
+        details = details.push(text(meta.join("  ·  ")).size(11).color([0.50, 0.58, 0.72]));
+    }
+
+    container(details)
+        .padding(14)
+        .width(Length::Fill)
+        .style(|_theme: &Theme| iced::widget::container::Style {
+            background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.03))),
+            border: Border {
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.10),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 fn search_task(request: ProjectSearchRequest) -> Task<Message> {
-    Task::perform(async move { search_projects(request) }, Message::ProjectsLoaded)
+    Task::perform(
+        async move { search_projects(request) },
+        Message::ProjectsLoaded,
+    )
 }
 
 fn launch_task(request: LaunchRequest) -> Task<Message> {
@@ -863,11 +1044,15 @@ fn refresh_versions_button(app: &NovaLauncher) -> iced::widget::Button<'_, Messa
     }
 }
 
+/// Field: a muted label above a control.
 fn field<'a>(label: &'a str, control: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    column![text(label).size(14), control.into()]
-        .spacing(8)
-        .width(Length::Fill)
-        .into()
+    column![
+        text(label).size(12).color([0.60, 0.66, 0.78]),
+        control.into(),
+    ]
+    .spacing(6)
+    .width(Length::Fill)
+    .into()
 }
 
 fn optional_path(value: &str) -> Option<PathBuf> {
@@ -877,6 +1062,17 @@ fn optional_path(value: &str) -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(trimmed))
+    }
+}
+
+/// Human-readable download count: 1 200 000 → "1.2M", 45 000 → "45K", etc.
+fn format_downloads(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -926,7 +1122,7 @@ impl LayoutMode {
         match self {
             Self::Narrow => 520,
             Self::Medium => 640,
-            Self::Wide => 780,
+            Self::Wide => 800,
         }
     }
 }
